@@ -143,18 +143,24 @@ export const mockDb = {
   ]
 };
 
+let activeHost = process.env.DB_HOST || '127.0.0.1';
+
+function createPoolForHost(host) {
+  return mysql.createPool({
+    host: host,
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'masupport',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+  });
+}
+
 if (!isMock) {
   try {
-    pool = mysql.createPool({
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'root',
-      password: process.env.DB_PASSWORD || '',
-      database: process.env.DB_NAME || 'masupport',
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0
-    });
-    console.log('MySQL Connection Pool initialized.');
+    pool = createPoolForHost(activeHost);
+    console.log(`MySQL Connection Pool initialized for host: ${activeHost}`);
   } catch (err) {
     console.error('MySQL Connection failed. Falling back to Mock Database mode.', err);
     process.env.MOCK_DB = 'true';
@@ -168,8 +174,26 @@ const db = {
     if (process.env.MOCK_DB === 'true' || isMock || !pool) {
       return executeMockQuery(sql, params);
     }
-    const [results] = await pool.query(sql, params);
-    return results;
+    try {
+      const [results] = await pool.query(sql, params);
+      return results;
+    } catch (err) {
+      // Auto-fallback: if access denied or connection error, try alternate host (127.0.0.1 <-> localhost)
+      const altHost = activeHost === '127.0.0.1' ? 'localhost' : '127.0.0.1';
+      if (err.code === 'ER_ACCESS_DENIED_ERROR' || err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+        try {
+          const fallbackPool = createPoolForHost(altHost);
+          const [results] = await fallbackPool.query(sql, params);
+          console.log(`🔄 [DB Auto-Switch] Successfully connected via alternate host: ${altHost}`);
+          pool = fallbackPool;
+          activeHost = altHost;
+          return results;
+        } catch (fallbackErr) {
+          throw err;
+        }
+      }
+      throw err;
+    }
   }
 };
 
