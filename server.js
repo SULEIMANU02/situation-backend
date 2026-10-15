@@ -17,6 +17,7 @@ import directiveRoutes from './routes/directives.js';
 import whatsappRoutes from './routes/whatsapp.js';
 
 import { startWhatsApp } from './services/whatsapp.js';
+import db from './config/db.js';
 
 dotenv.config();
 
@@ -69,6 +70,30 @@ app.get('/', (req, res) => {
     state: 'Bauchi State',
     mockMode: process.env.MOCK_DB === 'true'
   });
+});
+
+// Database Diagnostic Check Endpoint
+app.get(['/db-check', '/api/db-check'], async (req, res) => {
+  try {
+    const lgaRows = await db.query('SELECT COUNT(*) as count FROM lgas');
+    const puRows = await db.query('SELECT COUNT(*) as count FROM polling_units');
+    const userRows = await db.query('SELECT COUNT(*) as count FROM users');
+    res.json({
+      database: 'CONNECTED',
+      status: 'OK',
+      tables: {
+        lgas: lgaRows[0]?.count ?? lgaRows?.count ?? 0,
+        polling_units: puRows[0]?.count ?? puRows?.count ?? 0,
+        users: userRows[0]?.count ?? userRows?.count ?? 0
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      database: 'DISCONNECTED',
+      error: error.message || error,
+      code: error.code || 'DB_ERROR'
+    });
+  }
 });
 
 // Global Error Handler
