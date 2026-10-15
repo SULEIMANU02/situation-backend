@@ -6,6 +6,12 @@ import fs from 'fs';
 import db from '../config/db.js';
 import { parseWhatsAppMessage, transcribeAudio } from './groq.js';
 import { sendSecurityAlert } from '../routes/ussd.js';
+import {
+  restoreSessionFiles,
+  syncSessionFiles,
+  clearSession,
+  hasSavedSession
+} from './whatsappSessionStore.js';
 
 import QRCode from 'qrcode';
 
@@ -15,6 +21,7 @@ let currentQr = null;
 let currentQrDataUrl = null;
 let isConnected = false;
 let connectedUser = null;
+let hasSessionSaved = false;
 let isServiceActive = process.env.ENABLE_WHATSAPP === 'true';
 
 /**
@@ -41,7 +48,7 @@ export function stopWhatsApp() {
   currentQr = null;
   currentQrDataUrl = null;
   connectedUser = null;
-  console.log('🛑 WhatsApp service stopped and put into STANDBY mode.');
+  console.log('🛑 WhatsApp service stopped and put into STANDBY mode. Saved credentials preserved in MySQL.');
 }
 
 /**
@@ -52,6 +59,7 @@ export function getWhatsAppStatus() {
     isEnabled: isServiceActive,
     isConnected,
     connectedUser,
+    hasSavedSession: Boolean(hasSessionSaved),
     hasQr: Boolean(currentQr),
     qrDataUrl: currentQrDataUrl,
     qrRaw: currentQr
@@ -80,10 +88,23 @@ function getPhoneVariants(phone) {
 
 /**
  * Initializes and starts the Baileys WhatsApp bot.
+ * Features persistent ONE-TIME CONNECTION: restores saved session from MySQL,
+ * so the user never has to re-scan QR codes across server restarts or redeploys.
  */
 export async function startWhatsApp() {
   isServiceActive = true;
   console.log('🤖 Starting WhatsApp Bot Service for APM Situation Room...');
+
+  // 1. Restore any saved session from MySQL database before loading multi-file auth
+  try {
+    const restored = await restoreSessionFiles('auth_info_baileys');
+    hasSessionSaved = restored || (await hasSavedSession('auth_info_baileys'));
+    if (hasSessionSaved) {
+      console.log('🔑 One-time session recognized. Reconnecting silently in background...');
+    }
+  } catch (storeErr) {
+    console.warn('⚠️ Session store check notice:', storeErr.message);
+  }
 
   // Fetch the latest WhatsApp Web version to avoid 405 errors
   let version;
@@ -101,6 +122,12 @@ export async function startWhatsApp() {
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
+    browser: ['APM Situation Room', 'Chrome', '124.0.0.0'],
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000,
     ...(version && { version })
   });
 
@@ -117,7 +144,7 @@ export async function startWhatsApp() {
         } catch (qrErr) {
           currentQrDataUrl = null;
         }
-        console.log(`📱 [WhatsApp] Live pairing QR generated (${new Date().toLocaleTimeString()}). Viewable in portal at /portal.`);
+        console.log(`📱 [WhatsApp] One-Time pairing QR generated (${new Date().toLocaleTimeString()}). Viewable in portal at /portal.`);
       }
       if (connection === 'close') {
         isConnected = false;
@@ -151,22 +178,16 @@ export async function startWhatsApp() {
           currentQrDataUrl = null;
           connectedUser = null;
           if (isExplicitLogout) {
-            console.log('🚪 WhatsApp session logged out from phone. Clearing session credentials...');
-            try {
-              if (fs.existsSync('auth_info_baileys')) {
-                fs.rmSync('auth_info_baileys', { recursive: true, force: true });
-              }
-              console.log('🗑️ Session credentials cleared.');
-            } catch (rmErr) {
-              console.error('❌ Failed to clear credentials directory:', rmErr?.message || rmErr);
-            }
+            console.log('🚪 WhatsApp session logged out from phone. Clearing session credentials from MySQL & disk...');
+            await clearSession('auth_info_baileys');
+            hasSessionSaved = false;
           } else {
-            console.log('⏸️ WhatsApp service stopped or on standby. Session credentials safely preserved.');
+            console.log('⏸️ WhatsApp service stopped or on standby. Session credentials safely preserved in MySQL.');
           }
         }
       } else if (connection === 'open') {
         console.log('===================================================');
-        console.log('✅ Connected to WhatsApp successfully!');
+        console.log('✅ Connected to WhatsApp successfully (One-Time Connection Active)!');
         console.log('===================================================');
         whatsAppSocket = sock;
         isConnected = true;
@@ -174,13 +195,27 @@ export async function startWhatsApp() {
         currentQr = null;
         currentQrDataUrl = null;
         connectedUser = sock.user || null;
+        hasSessionSaved = true;
+
+        // Immediately backup session keys to MySQL database
+        syncSessionFiles('auth_info_baileys').catch((e) =>
+          console.warn('⚠️ Session sync on open notice:', e.message)
+        );
       }
     } catch (handlerErr) {
       console.error('⚠️ Error in WhatsApp connection.update handler:', handlerErr?.message || handlerErr);
     }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', async () => {
+    try {
+      await saveCreds();
+      hasSessionSaved = true;
+      await syncSessionFiles('auth_info_baileys');
+    } catch (saveErr) {
+      console.warn('⚠️ Error saving/syncing creds:', saveErr.message);
+    }
+  });
 
   sock.ev.on('messages.upsert', async (m) => {
     console.log('📩 [Baileys Event] messages.upsert triggered:', JSON.stringify(m, null, 2));

@@ -17,6 +17,7 @@ import directiveRoutes from './routes/directives.js';
 import whatsappRoutes from './routes/whatsapp.js';
 
 import { startWhatsApp } from './services/whatsapp.js';
+import { hasSavedSession } from './services/whatsappSessionStore.js';
 import db from './config/db.js';
 
 dotenv.config();
@@ -114,12 +115,24 @@ app.listen(PORT, () => {
   console.log(`⚙️  Mock DB mode: ${process.env.MOCK_DB === 'true' ? 'ENABLED (InMemory)' : 'DISABLED (MySQL)'}`);
   console.log(`===================================================`);
 
-  // Start WhatsApp bot service only if explicitly enabled
-  if (process.env.ENABLE_WHATSAPP === 'true') {
-    startWhatsApp().catch((err) => {
-      console.error('❌ Failed to start WhatsApp bot:', err);
-    });
-  } else {
-    console.log('ℹ️  WhatsApp Bot service is STANDBY (ENABLE_WHATSAPP=false). Activate on-demand via Situation Room portal or /api/whatsapp/start.');
-  }
+  // Start WhatsApp bot:
+  // If a saved session exists in MySQL or disk, auto-connect silently in background (One-Time Connection).
+  // Otherwise, only start if ENABLE_WHATSAPP is explicitly set to true.
+  hasSavedSession('auth_info_baileys').then((hasSession) => {
+    if (hasSession) {
+      console.log('🔑 Saved WhatsApp session found (One-Time Connection). Auto-connecting silently in background...');
+      startWhatsApp().catch((err) => {
+        console.error('❌ Failed to restore WhatsApp session:', err?.message || err);
+      });
+    } else if (process.env.ENABLE_WHATSAPP === 'true') {
+      console.log('🤖 WhatsApp Bot enabled. Initializing pairing session...');
+      startWhatsApp().catch((err) => {
+        console.error('❌ Failed to start WhatsApp bot:', err?.message || err);
+      });
+    } else {
+      console.log('ℹ️  WhatsApp Bot in Standby. Open Situation Room Portal to link your phone once.');
+    }
+  }).catch((err) => {
+    console.warn('⚠️ Session check on startup notice:', err.message);
+  });
 });

@@ -1,13 +1,13 @@
 import express from 'express';
-import fs from 'fs';
 import QRCode from 'qrcode';
 import { getWhatsAppStatus, startWhatsApp, stopWhatsApp } from '../services/whatsapp.js';
+import { clearSession, hasSavedSession } from '../services/whatsappSessionStore.js';
 
 const router = express.Router();
 
 /**
  * GET /api/whatsapp/status
- * Returns connection state and base64 QR data URL for scanning in the portal UI
+ * Returns connection state, one-time pairing status, and base64 QR data URL
  */
 router.get('/status', async (req, res) => {
   try {
@@ -20,10 +20,12 @@ router.get('/status', async (req, res) => {
         qrDataUrl = null;
       }
     }
+    const saved = status.hasSavedSession || (await hasSavedSession('auth_info_baileys'));
     return res.json({
       success: true,
       data: {
         ...status,
+        hasSavedSession: saved,
         qrDataUrl
       }
     });
@@ -98,17 +100,15 @@ router.post('/refresh', async (req, res) => {
 
 /**
  * POST /api/whatsapp/disconnect
- * Explicitly clears saved Baileys auth tokens and resets session
+ * Explicitly clears saved Baileys auth tokens from MySQL and disk and resets session
  */
-router.post('/disconnect', (req, res) => {
+router.post('/disconnect', async (req, res) => {
   try {
     stopWhatsApp();
-    if (fs.existsSync('auth_info_baileys')) {
-      fs.rmSync('auth_info_baileys', { recursive: true, force: true });
-    }
+    await clearSession('auth_info_baileys');
     return res.json({
       success: true,
-      message: 'WhatsApp session credentials cleared. Service reset to standby.'
+      message: 'WhatsApp session credentials permanently cleared from database and disk. Service reset.'
     });
   } catch (err) {
     return res.status(500).json({
