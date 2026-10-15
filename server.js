@@ -114,8 +114,12 @@ app.listen(PORT, () => {
   console.log(`⚙️  Mock DB mode: ${process.env.MOCK_DB === 'true' ? 'ENABLED (InMemory)' : 'DISABLED (MySQL)'}`);
   console.log(`===================================================`);
 
-  // Start WhatsApp bot service
-  startWhatsApp().catch((err) => {
-    console.error('❌ Failed to start WhatsApp bot:', err);
-  });
+  // Start WhatsApp bot service only if explicitly enabled
+  if (process.env.ENABLE_WHATSAPP === 'true') {
+    startWhatsApp().catch((err) => {
+      console.error('❌ Failed to start WhatsApp bot:', err);
+    });
+  } else {
+    console.log('ℹ️  WhatsApp Bot service is STANDBY (ENABLE_WHATSAPP=false). Activate on-demand via Situation Room portal or /api/whatsapp/start.');
+  }
 });

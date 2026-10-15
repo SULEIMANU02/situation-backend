@@ -15,6 +15,7 @@ let currentQr = null;
 let currentQrDataUrl = null;
 let isConnected = false;
 let connectedUser = null;
+let isServiceActive = process.env.ENABLE_WHATSAPP === 'true';
 
 /**
  * Returns the active WhatsApp socket instance.
@@ -25,10 +26,30 @@ export function getWhatsAppSocket() {
 }
 
 /**
+ * Gracefully stops the active WhatsApp socket without deleting credentials.
+ * Sets the service to standby mode.
+ */
+export function stopWhatsApp() {
+  isServiceActive = false;
+  if (whatsAppSocket) {
+    try {
+      whatsAppSocket.end(undefined);
+    } catch (e) {}
+    whatsAppSocket = null;
+  }
+  isConnected = false;
+  currentQr = null;
+  currentQrDataUrl = null;
+  connectedUser = null;
+  console.log('🛑 WhatsApp service stopped and put into STANDBY mode.');
+}
+
+/**
  * Returns the current live status and QR data URL for the web portal UI.
  */
 export function getWhatsAppStatus() {
   return {
+    isEnabled: isServiceActive,
     isConnected,
     connectedUser,
     hasQr: Boolean(currentQr),
@@ -61,6 +82,7 @@ function getPhoneVariants(phone) {
  * Initializes and starts the Baileys WhatsApp bot.
  */
 export async function startWhatsApp() {
+  isServiceActive = true;
   console.log('🤖 Starting WhatsApp Bot Service for APM Situation Room...');
 
   // Fetch the latest WhatsApp Web version to avoid 405 errors
@@ -102,7 +124,8 @@ export async function startWhatsApp() {
         whatsAppSocket = null;
         const errObj = lastDisconnect?.error;
         const statusCode = errObj?.output?.statusCode || errObj?.output?.payload?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const isExplicitLogout = statusCode === DisconnectReason.loggedOut;
+        const shouldReconnect = isServiceActive && !isExplicitLogout;
         const errMsg = errObj?.message || 'Connection closed';
 
         console.log(`🔌 WhatsApp connection closed: ${errMsg} (Status Code: ${statusCode || 'unknown'}). Reconnecting: ${shouldReconnect}`);
@@ -116,23 +139,29 @@ export async function startWhatsApp() {
             }
             setTimeout(() => {
               isReconnecting = false;
-              startWhatsApp().catch((err) => {
-                console.error('❌ Error restarting WhatsApp service:', err?.message || err);
-              });
+              if (isServiceActive) {
+                startWhatsApp().catch((err) => {
+                  console.error('❌ Error restarting WhatsApp service:', err?.message || err);
+                });
+              }
             }, delay);
           }
         } else {
-          console.log('🚪 Logged out of WhatsApp. Clearing session credentials...');
           currentQr = null;
           currentQrDataUrl = null;
           connectedUser = null;
-          try {
-            if (fs.existsSync('auth_info_baileys')) {
-              fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+          if (isExplicitLogout) {
+            console.log('🚪 WhatsApp session logged out from phone. Clearing session credentials...');
+            try {
+              if (fs.existsSync('auth_info_baileys')) {
+                fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+              }
+              console.log('🗑️ Session credentials cleared.');
+            } catch (rmErr) {
+              console.error('❌ Failed to clear credentials directory:', rmErr?.message || rmErr);
             }
-            console.log('🗑️ Session credentials cleared. A new QR code will be generated on next start.');
-          } catch (rmErr) {
-            console.error('❌ Failed to clear credentials directory:', rmErr?.message || rmErr);
+          } else {
+            console.log('⏸️ WhatsApp service stopped or on standby. Session credentials safely preserved.');
           }
         }
       } else if (connection === 'open') {
