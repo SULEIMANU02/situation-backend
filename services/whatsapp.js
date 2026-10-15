@@ -227,9 +227,6 @@ export async function startWhatsApp() {
             console.log(`🎙️ Groq Voice Transcript: "${text}"`);
           } else {
             text = (msg.message.imageMessage?.caption || msg.message.videoMessage?.caption || '').trim();
-            if (!text) {
-              text = 'Incident report with media attachment.';
-            }
           }
         } catch (mediaErr) {
           console.error('❌ Failed to download and process media message:', mediaErr);
@@ -246,12 +243,12 @@ export async function startWhatsApp() {
         ).trim();
       }
 
-      if (!text) {
+      if (!text && !isImage && !isVideo) {
         console.log(`ℹ️ Ignoring empty message from ${phone}`);
         continue;
       }
 
-      console.log(`💬 WhatsApp from ${phone}: "${text}"`);
+      console.log(`💬 WhatsApp from ${phone}: "${text || (isImage ? '[Photo]' : isVideo ? '[Video]' : '')}"`);
 
       try {
         // 1. Check if the user is registered in the database
@@ -264,9 +261,9 @@ export async function startWhatsApp() {
 
         if (users && users.length > 0) {
           const user = users[0];
-          await handleRegisteredUser(sock, senderJid, text, user, fileUrl, (isImage || isVideo));
+          await handleRegisteredUser(sock, senderJid, text, user, fileUrl, isImage, isVideo);
         } else {
-          await handleUnregisteredUser(sock, senderJid, text, phone);
+          await handleUnregisteredUser(sock, senderJid, text, phone, fileUrl, isImage, isVideo);
         }
       } catch (error) {
         console.error('Error handling WhatsApp message:', error);
@@ -280,10 +277,11 @@ export async function startWhatsApp() {
 
 /**
  * Handles incoming messages from registered agents.
- * Auto-detects results vs incidents using AI, then confirms before saving.
+ * If media (photo/video) is sent, prompts agent whether it is a Result Sheet or Incident Report,
+ * then guides them through confirming/supplying details before routing to the database.
  */
-async function handleRegisteredUser(sock, senderJid, text, user, fileUrl = null, isImageOrVideo = false) {
-  const input = text.trim();
+async function handleRegisteredUser(sock, senderJid, text, user, fileUrl = null, isImage = false, isVideo = false) {
+  const input = (text || '').trim();
 
   // Resolve polling unit name and hierarchy
   let puName = 'Assigned Polling Unit';
@@ -314,8 +312,262 @@ async function handleRegisteredUser(sock, senderJid, text, user, fileUrl = null,
   const userTier = tierMap[user.role] || 'PU';
 
   // ═══════════════════════════════════════
-  // DIRECTIVE COMMANDS: ACK, PROGRESS, ISSUE, REPORT
-  // These allow field agents to respond to directives via WhatsApp
+  // 1. PHOTO OR VIDEO RECEIVED
+  // Intercept immediately: Ask sender if it's a Result Sheet or Incident Evidence
+  // ═══════════════════════════════════════
+  if (isImage || isVideo) {
+    pendingConfirmations.set(senderJid, {
+      state: 'AWAITING_MEDIA_TYPE',
+      fileUrl,
+      caption: input,
+      isImage,
+      isVideo,
+      puName,
+      lgaName,
+      wardName,
+      timestamp: Date.now()
+    });
+
+    await sock.sendMessage(senderJid, {
+      text: `📸 *Photo Received!*\n\nAssalamu Alaikum *${user.fullname}*!\nPlease tell us where to send this photo:\n\n1️⃣ *Result* (reply *1*) — Official Result Sheet (Form EC8A)\n2️⃣ *Incident* (reply *2*) — Incident / Violation / Emergency Evidence\n\n━━━━━━━━━━━━━━━━━━━━━\n👉 Reply *1* for Result Sheet\n👉 Reply *2* for Incident Report\n❌ Reply *Cancel* to discard`
+    });
+    return;
+  }
+
+  // ═══════════════════════════════════════
+  // 2. CHECK PENDING INTERACTIVE SESSIONS
+  // ═══════════════════════════════════════
+  const pending = pendingConfirmations.get(senderJid);
+  if (pending) {
+    const rawClean = input.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    // Universal Cancel Handler
+    if (rawClean === 'cancel' || rawClean === 'abort' || rawClean === 'discard' || (rawClean === 'no' && pending.state === 'AWAITING_MEDIA_TYPE')) {
+      pendingConfirmations.delete(senderJid);
+      await sock.sendMessage(senderJid, {
+        text: '❌ *Cancelled.* The photo and operation have been discarded.'
+      });
+      return;
+    }
+
+    // STATE A: Sender is deciding whether photo is a Result Sheet or Incident Evidence
+    if (pending.state === 'AWAITING_MEDIA_TYPE') {
+      const isResult = rawClean === '1' || rawClean === 'result' || rawClean === 'results' || rawClean === 'sheet' || rawClean === 'ec8a' || rawClean === 'sakmako' || rawClean.includes('result') || rawClean.includes('sheet');
+      const isIncident = rawClean === '2' || rawClean === 'incident' || rawClean === 'inc' || rawClean === 'incidents' || rawClean === 'evidence' || rawClean === 'fada' || rawClean === 'matsala' || rawClean === 'emergency' || rawClean === 'violence' || rawClean.includes('incident') || rawClean.includes('evidence');
+
+      if (isResult) {
+        // Selected RESULT SHEET
+        let parsedResult = null;
+        if (pending.caption && pending.caption.length > 0) {
+          try {
+            const parsed = await parseWhatsAppMessage(pending.caption);
+            if (parsed && parsed.type === 'result' && parsed.data) {
+              const { apm = 0, apc = 0, pdp = 0, prp = 0, adc = 0, invalid = 0 } = parsed.data;
+              if ((apm + apc + pdp + prp + adc + invalid) > 0) {
+                parsedResult = parsed.data;
+              }
+            }
+          } catch (e) {
+            console.log('Error parsing caption for results:', e.message);
+          }
+        }
+
+        if (parsedResult) {
+          // Votes were already provided in the image caption
+          const total = (parsedResult.apm || 0) + (parsedResult.apc || 0) + (parsedResult.pdp || 0) + (parsedResult.prp || 0) + (parsedResult.adc || 0) + (parsedResult.invalid || 0);
+          pendingConfirmations.set(senderJid, {
+            state: 'CONFIRM_RESULT',
+            type: 'result',
+            data: parsedResult,
+            fileUrl: pending.fileUrl,
+            isImageOrVideo: true,
+            puName: pending.puName
+          });
+
+          await sock.sendMessage(senderJid, {
+            text: `📊 *Please confirm these results from your sheet:*\n\n📍 *PU:* ${pending.puName}\n━━━━━━━━━━━━━━━━━━━━━\n🗳️ *APM:* ${parsedResult.apm}\n🗳️ *APC:* ${parsedResult.apc}\n🗳️ *PDP:* ${parsedResult.pdp}\n🗳️ *PRP:* ${parsedResult.prp}\n🗳️ *ADC:* ${parsedResult.adc}\n⚠️ *Invalid:* ${parsedResult.invalid}\n📊 *Total:* ${total}\n📸 *Result Sheet:* Attached\n━━━━━━━━━━━━━━━━━━━━━\n\n✅ Reply *Yes* to submit to Situation Room\n❌ Reply *No* to cancel`
+          });
+        } else {
+          // Caption was empty or had no numbers -> transition to AWAITING_RESULT_SCORES
+          pendingConfirmations.set(senderJid, {
+            state: 'AWAITING_RESULT_SCORES',
+            fileUrl: pending.fileUrl,
+            isImageOrVideo: true,
+            puName: pending.puName
+          });
+
+          await sock.sendMessage(senderJid, {
+            text: `📊 *Result Sheet Photo Stored!*\n\n📍 *PU:* ${pending.puName}\n📸 Official sheet saved.\n\nPlease reply with the official vote tallies from this Form EC8A sheet:\n\n*Format:*\n*APM [votes], APC [votes], PDP [votes], PRP [votes], ADC [votes], Invalid [votes]*\n\n*Example:*\n_APM 145, APC 90, PDP 50, PRP 5, ADC 2, Invalid 1_\n\n_(You can type in English, Hausa, or send a voice note)_`
+          });
+        }
+        return;
+      }
+
+      if (isIncident) {
+        // Selected INCIDENT EVIDENCE
+        let parsedIncident = null;
+        if (pending.caption && pending.caption.length > 3) {
+          try {
+            const parsed = await parseWhatsAppMessage(pending.caption);
+            if (parsed && parsed.type === 'incident' && parsed.incident) {
+              parsedIncident = parsed.incident;
+            } else {
+              parsedIncident = { category: 'OTHER', description: pending.caption };
+            }
+          } catch (e) {
+            parsedIncident = { category: 'OTHER', description: pending.caption };
+          }
+        }
+
+        if (parsedIncident) {
+          // Description already provided in caption
+          pendingConfirmations.set(senderJid, {
+            state: 'CONFIRM_INCIDENT',
+            type: 'incident',
+            incident: parsedIncident,
+            fileUrl: pending.fileUrl,
+            isImageOrVideo: true,
+            puName: pending.puName
+          });
+
+          await sock.sendMessage(senderJid, {
+            text: `🚨 *Please confirm this incident report:*\n\n📍 *PU:* ${pending.puName}\n━━━━━━━━━━━━━━━━━━━━━\n📂 *Category:* ${parsedIncident.category.replace(/_/g, ' ')}\n📝 *Description:* ${parsedIncident.description}\n📸 *Evidence:* Photo Attached\n━━━━━━━━━━━━━━━━━━━━━\n\n✅ Reply *Yes* to dispatch to Situation Room & Security\n❌ Reply *No* to cancel`
+          });
+        } else {
+          // Transition to AWAITING_INCIDENT_DETAILS
+          pendingConfirmations.set(senderJid, {
+            state: 'AWAITING_INCIDENT_DETAILS',
+            fileUrl: pending.fileUrl,
+            isImageOrVideo: true,
+            puName: pending.puName
+          });
+
+          await sock.sendMessage(senderJid, {
+            text: `🚨 *Incident Evidence Photo Stored!*\n\n📍 *PU:* ${pending.puName}\n📸 Photo evidence saved.\n\nPlease describe what happened at this polling unit:\n\n*Example:*\n_"Armed political thugs disrupted voting and tried to snatch ballot box"_\nor\n_"BVAS machine stopped working since 11am"_\n\n_(You can describe in English, Hausa, or send a voice note)_`
+          });
+        }
+        return;
+      }
+
+      // Neither 1 nor 2 recognized
+      await sock.sendMessage(senderJid, {
+        text: `❓ *Please reply with 1 or 2:*\n\n1️⃣ Reply *1* or *Result* — Official Result Sheet (Form EC8A)\n2️⃣ Reply *2* or *Incident* — Incident / Violation Evidence\n\n❌ Reply *Cancel* to discard.`
+      });
+      return;
+    }
+
+    // STATE B: Awaiting vote scores for result sheet
+    if (pending.state === 'AWAITING_RESULT_SCORES') {
+      try {
+        const parsed = await parseWhatsAppMessage(input);
+        if (parsed && parsed.type === 'result' && parsed.data) {
+          const { apm = 0, apc = 0, pdp = 0, prp = 0, adc = 0, invalid = 0 } = parsed.data;
+          const total = apm + apc + pdp + prp + adc + invalid;
+
+          pendingConfirmations.set(senderJid, {
+            state: 'CONFIRM_RESULT',
+            type: 'result',
+            data: { apm, apc, pdp, prp, adc, invalid },
+            fileUrl: pending.fileUrl,
+            isImageOrVideo: true,
+            puName: pending.puName
+          });
+
+          await sock.sendMessage(senderJid, {
+            text: `📊 *Please confirm these results from your sheet:*\n\n📍 *PU:* ${pending.puName}\n━━━━━━━━━━━━━━━━━━━━━\n🗳️ *APM:* ${apm}\n🗳️ *APC:* ${apc}\n🗳️ *PDP:* ${pdp}\n🗳️ *PRP:* ${prp}\n🗳️ *ADC:* ${adc}\n⚠️ *Invalid:* ${invalid}\n📊 *Total:* ${total}\n📸 *Result Sheet:* Attached\n━━━━━━━━━━━━━━━━━━━━━\n\n✅ Reply *Yes* to submit to Situation Room\n❌ Reply *No* to re-enter`
+          });
+          return;
+        }
+      } catch (e) {
+        console.error('Error parsing scores in AWAITING_RESULT_SCORES:', e);
+      }
+
+      await sock.sendMessage(senderJid, {
+        text: `⚠️ Could not understand vote counts.\n\nPlease reply like this:\n*APM 145, APC 90, PDP 50, PRP 5, ADC 2, Invalid 1*\n\nOr reply *Cancel* to discard.`
+      });
+      return;
+    }
+
+    // STATE C: Awaiting incident description for evidence photo
+    if (pending.state === 'AWAITING_INCIDENT_DETAILS') {
+      let category = 'OTHER';
+      let description = input;
+      try {
+        const parsed = await parseWhatsAppMessage(input);
+        if (parsed && parsed.type === 'incident' && parsed.incident) {
+          category = parsed.incident.category || 'OTHER';
+          description = parsed.incident.description || input;
+        }
+      } catch (e) {
+        console.error('Error parsing incident details:', e);
+      }
+
+      pendingConfirmations.set(senderJid, {
+        state: 'CONFIRM_INCIDENT',
+        type: 'incident',
+        incident: { category, description },
+        fileUrl: pending.fileUrl,
+        isImageOrVideo: true,
+        puName: pending.puName
+      });
+
+      await sock.sendMessage(senderJid, {
+        text: `🚨 *Please confirm this incident report:*\n\n📍 *PU:* ${pending.puName}\n━━━━━━━━━━━━━━━━━━━━━\n📂 *Category:* ${category.replace(/_/g, ' ')}\n📝 *Description:* ${description}\n📸 *Evidence:* Photo Attached\n━━━━━━━━━━━━━━━━━━━━━\n\n✅ Reply *Yes* to submit & dispatch security\n❌ Reply *No* to re-enter`
+      });
+      return;
+    }
+
+    // STATE D: Final Confirmation of Result (Yes / No)
+    if (pending.state === 'CONFIRM_RESULT' || pending.type === 'result') {
+      const reply = rawClean;
+      if (reply === 'yes' || reply === 'confirm' || reply === 'ok' || reply === 'submit' || reply === 'y') {
+        try {
+          await saveElectionResult(pending.data, user, pending.fileUrl, true);
+          pendingConfirmations.delete(senderJid);
+          const r = pending.data;
+          const total = (r.apm || 0) + (r.apc || 0) + (r.pdp || 0) + (r.prp || 0) + (r.adc || 0) + (r.invalid || 0);
+          await sock.sendMessage(senderJid, {
+            text: `✅ *Election Results Submitted Successfully!*\n📸 *Result sheet image saved to Situation Room database.*\n\n📍 *PU:* ${pending.puName}\n🗳️ *APM:* ${r.apm}\n🗳️ *APC:* ${r.apc}\n🗳️ *PDP:* ${r.pdp}\n🗳️ *PRP:* ${r.prp}\n🗳️ *ADC:* ${r.adc}\n⚠️ *Invalid:* ${r.invalid}\n📊 *Total:* ${total}\n\nJazakallahu Khairan, Comrade! 🙏`
+          });
+        } catch (err) {
+          console.error('Error saving confirmed result:', err);
+          pendingConfirmations.delete(senderJid);
+          await sock.sendMessage(senderJid, { text: '❌ Server error while saving results. Please try again.' });
+        }
+        return;
+      } else if (reply === 'no' || reply === 'cancel' || reply === 'retry' || reply === 'n') {
+        pendingConfirmations.delete(senderJid);
+        await sock.sendMessage(senderJid, { text: '❌ *Cancelled.* Results submission discarded.' });
+        return;
+      }
+    }
+
+    // STATE E: Final Confirmation of Incident (Yes / No)
+    if (pending.state === 'CONFIRM_INCIDENT' || pending.type === 'incident') {
+      const reply = rawClean;
+      if (reply === 'yes' || reply === 'confirm' || reply === 'ok' || reply === 'submit' || reply === 'y') {
+        try {
+          await saveIncidentReport(pending.incident, user, pending.fileUrl, true, pending.puName);
+          pendingConfirmations.delete(senderJid);
+          await sock.sendMessage(senderJid, {
+            text: `🚨 *Incident Report Logged & Dispatched!*${pending.fileUrl ? '\n📸 *Evidence photo saved.*' : ''}\n\n📍 *PU:* ${pending.puName}\n📂 *Category:* ${pending.incident.category.replace(/_/g, ' ')}\n📝 *Description:* ${pending.incident.description}\n👮 *Status:* Dispatched to security teams & Situation Room map.\n\nJazakallahu Khairan, Comrade! 🙏`
+          });
+        } catch (err) {
+          console.error('Error saving confirmed incident:', err);
+          pendingConfirmations.delete(senderJid);
+          await sock.sendMessage(senderJid, { text: '❌ Server error while saving incident. Please try again.' });
+        }
+        return;
+      } else if (reply === 'no' || reply === 'cancel' || reply === 'retry' || reply === 'n') {
+        pendingConfirmations.delete(senderJid);
+        await sock.sendMessage(senderJid, { text: '❌ *Cancelled.* Incident report discarded.' });
+        return;
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════
+  // 3. DIRECTIVE COMMANDS: ACK, PROGRESS, ISSUE, REPORT
   // ═══════════════════════════════════════
   const upperInput = input.toUpperCase();
 
@@ -462,50 +714,7 @@ async function handleRegisteredUser(sock, senderJid, text, user, fileUrl = null,
   }
 
   // ═══════════════════════════════════════
-  // Check for pending confirmation first
-  // ═══════════════════════════════════════
-  const pending = pendingConfirmations.get(senderJid);
-  if (pending) {
-    const reply = input.toLowerCase();
-    if (reply === 'yes' || reply === 'confirm' || reply === 'ok' || reply === 'submit') {
-      // User confirmed — save the data
-      try {
-        if (pending.type === 'result') {
-          await saveElectionResult(pending.data, user, pending.fileUrl, pending.isImageOrVideo);
-          pendingConfirmations.delete(senderJid);
-          const r = pending.data;
-          const total = (r.apm || 0) + (r.apc || 0) + (r.pdp || 0) + (r.prp || 0) + (r.adc || 0) + (r.invalid || 0);
-          await sock.sendMessage(senderJid, {
-            text: `✅ *Election Results Submitted Successfully!*${pending.fileUrl ? '\n📸 *Result sheet image saved.*' : ''}\n\n📍 *PU:* ${puName}\n🗳️ *APM:* ${r.apm}\n🗳️ *APC:* ${r.apc}\n🗳️ *PDP:* ${r.pdp}\n🗳️ *PRP:* ${r.prp}\n🗳️ *ADC:* ${r.adc}\n⚠️ *Invalid:* ${r.invalid}\n📊 *Total:* ${total}\n\nJazakallahu Khairan! 🙏`
-          });
-        } else if (pending.type === 'incident') {
-          await saveIncidentReport(pending.incident, user, pending.fileUrl, pending.isImageOrVideo, puName);
-          pendingConfirmations.delete(senderJid);
-          await sock.sendMessage(senderJid, {
-            text: `⚠️ *Incident Report Logged!*${pending.fileUrl ? '\n📸 *Evidence media saved.*' : ''}\n\n📍 *PU:* ${puName}\n📂 *Category:* ${pending.incident.category.replace(/_/g, ' ')}\n📝 *Description:* ${pending.incident.description}\n👮 *Status:* Dispatched to security teams.\n\nJazakallahu Khairan! 🙏`
-          });
-        }
-      } catch (err) {
-        console.error('Error saving confirmed data:', err);
-        pendingConfirmations.delete(senderJid);
-        await sock.sendMessage(senderJid, {
-          text: '❌ Server error while saving. Please send your report again.'
-        });
-      }
-      return;
-    } else if (reply === 'no' || reply === 'cancel' || reply === 'retry') {
-      pendingConfirmations.delete(senderJid);
-      await sock.sendMessage(senderJid, {
-        text: '❌ *Cancelled.* Please send your report again.'
-      });
-      return;
-    }
-    // If they sent something else, treat it as a new message (clear the old pending)
-    pendingConfirmations.delete(senderJid);
-  }
-
-  // ═══════════════════════════════════════
-  // Parse message with AI
+  // 4. PARSE STANDARD TEXT MESSAGE WITH AI
   // ═══════════════════════════════════════
   try {
     const parsed = await parseWhatsAppMessage(input);
@@ -515,12 +724,13 @@ async function handleRegisteredUser(sock, senderJid, text, user, fileUrl = null,
       const { apm = 0, apc = 0, pdp = 0, prp = 0, adc = 0, invalid = 0 } = parsed.data || {};
       const total = apm + apc + pdp + prp + adc + invalid;
 
-      // Store for confirmation
       pendingConfirmations.set(senderJid, {
+        state: 'CONFIRM_RESULT',
         type: 'result',
         data: { apm, apc, pdp, prp, adc, invalid },
-        fileUrl,
-        isImageOrVideo
+        fileUrl: null,
+        isImageOrVideo: false,
+        puName
       });
 
       await sock.sendMessage(senderJid, {
@@ -530,12 +740,13 @@ async function handleRegisteredUser(sock, senderJid, text, user, fileUrl = null,
     } else if (parsed.type === 'incident') {
       const { category = 'OTHER', description = input } = parsed.incident || {};
 
-      // Store for confirmation
       pendingConfirmations.set(senderJid, {
+        state: 'CONFIRM_INCIDENT',
         type: 'incident',
         incident: { category, description },
-        fileUrl,
-        isImageOrVideo
+        fileUrl: null,
+        isImageOrVideo: false,
+        puName
       });
 
       await sock.sendMessage(senderJid, {
@@ -543,15 +754,14 @@ async function handleRegisteredUser(sock, senderJid, text, user, fileUrl = null,
       });
 
     } else {
-      // Unrecognized — send guide
       await sock.sendMessage(senderJid, {
-        text: `Assalamu Alaikum *${user.fullname}*! 👋\n\n🏛️ *APM Situation Room Bauchi*\n📍 *Your PU:* ${puName}\n\n━━━━━━━━━━━━━━━━━━━━━\n📋 *How to use this bot:*\n━━━━━━━━━━━━━━━━━━━━━\n\n🗳️ *To submit results*, just type naturally:\n_"APM 145, APC 90, PDP 50, PRP 5, ADC 2, Invalid 1"_\n\n🚨 *To report an incident*, just describe it:\n_"Thugs are disrupting voting at my polling unit"_\n\n📡 *DIRECTIVE COMMANDS:*\n✅ *ACK* — Acknowledge a received directive\n📊 *PROGRESS 5* — Report 5 completed for current directive\n🚨 *ISSUE [details]* — Escalate a problem up the chain\n📋 *REPORT [details]* — Send field intelligence upward\n\nYou can also send a *photo*, *video*, or *voice note* with your report! 📸🎤`
+        text: `Assalamu Alaikum *${user.fullname}*! 👋\n\n🏛️ *APM Situation Room Bauchi*\n📍 *Your PU:* ${puName}\n\n━━━━━━━━━━━━━━━━━━━━━\n📋 *How to use this bot:*\n━━━━━━━━━━━━━━━━━━━━━\n\n📸 *Send a Photo*: The bot will ask if it's an official Result Sheet or Incident Evidence, and guide you!\n\n🗳️ *To submit results via text*, just type:\n_"APM 145, APC 90, PDP 50, PRP 5, ADC 2, Invalid 1"_\n\n🚨 *To report an incident via text*, just describe it:\n_"Thugs are disrupting voting at my polling unit"_\n\n📡 *DIRECTIVE COMMANDS:*\n✅ *ACK* — Acknowledge a received directive\n📊 *PROGRESS 5* — Report 5 completed for current directive\n🚨 *ISSUE [details]* — Escalate a problem up the chain\n📋 *REPORT [details]* — Send field intelligence upward\n\nYou can also send a *photo*, *video*, or *voice note*! 📸🎤`
       });
     }
   } catch (err) {
     console.error('AI parsing error:', err.message);
     await sock.sendMessage(senderJid, {
-      text: `Assalamu Alaikum *${user.fullname}*! 👋\n\n🏛️ *APM Situation Room Bauchi*\n📍 *Your PU:* ${puName}\n\n━━━━━━━━━━━━━━━━━━━━━\n📋 *How to use this bot:*\n━━━━━━━━━━━━━━━━━━━━━\n\n🗳️ *To submit results*, just type naturally:\n_"APM 145, APC 90, PDP 50, PRP 5, ADC 2, Invalid 1"_\n\n🚨 *To report an incident*, just describe it:\n_"Thugs are disrupting voting at my polling unit"_\n\n📡 *DIRECTIVE COMMANDS:*\n✅ *ACK* — Acknowledge a directive\n📊 *PROGRESS 5* — Report progress\n🚨 *ISSUE [details]* — Escalate a problem\n📋 *REPORT [details]* — Send field intelligence\n\nYou can also send a *photo*, *video*, or *voice note*! 📸🎤`
+      text: `Assalamu Alaikum *${user.fullname}*! 👋\n\n🏛️ *APM Situation Room Bauchi*\n📍 *Your PU:* ${puName}\n\n━━━━━━━━━━━━━━━━━━━━━\n📋 *How to use this bot:*\n━━━━━━━━━━━━━━━━━━━━━\n\n📸 *Send a Photo*: The bot will ask if it is a Result Sheet or Incident Evidence!\n\n🗳️ *To submit results*, type:\n_"APM 145, APC 90, PDP 50, PRP 5, ADC 2, Invalid 1"_\n\n🚨 *To report an incident*, describe it:\n_"Thugs are disrupting voting at my polling unit"_\n\n📡 *DIRECTIVE COMMANDS:*\n✅ *ACK* — Acknowledge directive\n📊 *PROGRESS 5* — Report progress\n🚨 *ISSUE [details]* — Escalate problem\n\nYou can also send a *photo*, *video*, or *voice note*! 📸🎤`
     });
   }
 }
@@ -563,7 +773,8 @@ async function saveElectionResult(data, user, fileUrl, isImageOrVideo) {
   const { apm, apc, pdp, prp, adc, invalid } = data;
   const total = (apm || 0) + (apc || 0) + (pdp || 0) + (prp || 0) + (adc || 0) + (invalid || 0);
 
-  const existing = await db.query('SELECT id FROM election_results WHERE polling_unit_id = ?', [user.polling_unit_id]);
+  const puId = user.polling_unit_id || 1;
+  const existing = await db.query('SELECT id FROM election_results WHERE polling_unit_id = ?', [puId]);
   if (existing && existing.length > 0) {
     let updateQuery = `
       UPDATE election_results 
@@ -575,13 +786,13 @@ async function saveElectionResult(data, user, fileUrl, isImageOrVideo) {
       params.push(fileUrl);
     }
     updateQuery += ` WHERE polling_unit_id = ?`;
-    params.push(user.polling_unit_id);
+    params.push(puId);
     await db.query(updateQuery, params);
   } else {
     await db.query(
       `INSERT INTO election_results (polling_unit_id, apm_votes, apc_votes, pdp_votes, prp_votes, adc_votes, invalid_votes, total_votes, result_sheet_url, submitted_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [user.polling_unit_id, apm, apc, pdp, prp, adc, invalid, total, (fileUrl && isImageOrVideo) ? fileUrl : null, user.id]
+      [puId, apm, apc, pdp, prp, adc, invalid, total, (fileUrl && isImageOrVideo) ? fileUrl : null, user.id]
     );
   }
 }
@@ -593,10 +804,14 @@ async function saveIncidentReport(incident, user, fileUrl, isImageOrVideo, puNam
   const { category, description } = incident;
   const incidentTitle = `WhatsApp Report: ${category.replace(/_/g, ' ')}`;
 
+  const lgaId = user.lga_id || 1;
+  const wardId = user.ward_id || null;
+  const puId = user.polling_unit_id || null;
+
   await db.query(
     `INSERT INTO incidents (title, description, category, lga_id, ward_id, polling_unit_id, reported_by, image_url, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
-    [incidentTitle, description, category, user.lga_id || 1, user.ward_id || null, user.polling_unit_id || null, user.id, (fileUrl && isImageOrVideo) ? fileUrl : null]
+    [incidentTitle, description, category, lgaId, wardId, puId, user.id, (fileUrl && isImageOrVideo) ? fileUrl : null]
   );
 
   // Trigger high priority alerts
@@ -610,7 +825,56 @@ async function saveIncidentReport(incident, user, fileUrl, isImageOrVideo, puNam
 /**
  * Handles incoming messages from unregistered users.
  */
-async function handleUnregisteredUser(sock, senderJid, text, phone) {
+async function handleUnregisteredUser(sock, senderJid, text, phone, fileUrl = null, isImage = false, isVideo = false) {
+  if (isImage || isVideo) {
+    pendingConfirmations.set(senderJid, {
+      state: 'UNREGISTERED_INCIDENT_PHOTO',
+      fileUrl,
+      caption: text || '',
+      phone,
+      timestamp: Date.now()
+    });
+
+    await sock.sendMessage(senderJid, {
+      text: `📸 *Photo Received!*\n\nAssalamu Alaikum!\nYou are not registered as an official APM polling agent, but you can submit this photo as *Citizen Incident / Emergency Evidence*.\n\n👉 Please reply describing what happened and the Polling Unit / LGA location.\n_(Note: Official Result Sheets must be submitted by accredited agents.)_\n\n❌ Reply *Cancel* to discard.`
+    });
+    return;
+  }
+
+  const pending = pendingConfirmations.get(senderJid);
+  if (pending && pending.state === 'UNREGISTERED_INCIDENT_PHOTO') {
+    const rawInput = (text || '').trim();
+    if (rawInput.toLowerCase() === 'cancel') {
+      pendingConfirmations.delete(senderJid);
+      await sock.sendMessage(senderJid, { text: '❌ *Photo discarded.*' });
+      return;
+    }
+
+    try {
+      const parsed = await parseWhatsAppMessage(rawInput);
+      const category = (parsed?.type === 'incident' && parsed?.incident?.category) ? parsed.incident.category : 'OTHER';
+      const description = `Citizen WhatsApp Report (+${phone}): ${parsed?.incident?.description || rawInput}`;
+
+      const adminRows = await db.query("SELECT id FROM users WHERE role = 'SUPER_ADMIN' ORDER BY id ASC LIMIT 1");
+      const adminId = adminRows[0]?.id || 1;
+
+      await db.query(
+        `INSERT INTO incidents (title, description, category, lga_id, ward_id, polling_unit_id, reported_by, image_url, status)
+         VALUES (?, ?, ?, 1, NULL, NULL, ?, ?, 'PENDING')`,
+        ['Citizen WhatsApp Report: ' + category.replace(/_/g, ' '), description, category, adminId, pending.fileUrl]
+      );
+
+      pendingConfirmations.delete(senderJid);
+
+      await sock.sendMessage(senderJid, {
+        text: `🚨 *Citizen Incident Report Received!*\n📸 Evidence photo attached.\n👮 Dispatched to Situation Room Security Monitor.\n\nThank you for helping safeguard the election! 🙏`
+      });
+      return;
+    } catch (e) {
+      console.error('Error logging citizen incident:', e);
+    }
+  }
+
   await sock.sendMessage(senderJid, {
     text: `🚫 *Access Denied*\n\nYou are not registered as an active field agent for the *APM Situation Room Bauchi*.\n\nPlease contact your LGA coordinator or the situation room admin to get registered.`
   });
